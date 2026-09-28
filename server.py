@@ -205,6 +205,33 @@ OPTION_MAP = {
 }
 
 
+# The UI's thinking control sends Low/Medium/High as these token budgets.
+BUDGET_LEVELS = {512: "low", 2048: "medium", 8192: "high"}
+
+
+def think_setting(model, enabled, budget):
+    """Map the UI's thinking control to Ollama's `think` parameter.
+
+    Off -> False. Otherwise True, except gpt-oss, which takes a level instead
+    of on/off. Ollama has no token budgets, so levels only matter there.
+    """
+    if enabled is False:
+        return False
+    try:
+        family = show(model).get("details", {}).get("family", "")
+    except Exception:
+        family = ""
+    if "gptoss" in family.replace("-", ""):
+        return BUDGET_LEVELS.get(budget, "high" if budget == -1 else "medium")
+    return True
+
+
+# Appended to the chat template reported by /props for models Ollama says can
+# think. The UI only shows its thinking control when the (Jinja) template
+# mentions enable_thinking, and Ollama templates never do.
+THINKING_MARKER = "\n{#- ollama: thinking supported -#}{%- if enable_thinking is defined %}{% endif %}"
+
+
 def to_ollama_request(body):
     model = body.get("model")
     options = {v: body[k] for k, v in OPTION_MAP.items() if body.get(k) is not None}
@@ -216,7 +243,8 @@ def to_ollama_request(body):
         req["tools"] = body["tools"]
     kwargs = body.get("chat_template_kwargs") or {}
     if "thinking" in capabilities(model):
-        req["think"] = kwargs.get("enable_thinking", True) is not False
+        req["think"] = think_setting(model, kwargs.get("enable_thinking"),
+                                     body.get("thinking_budget_tokens"))
     return req
 
 
@@ -240,6 +268,26 @@ def openai_tool_calls(calls, start=0):
              "function": {"name": c["function"]["name"],
                           "arguments": json.dumps(c["function"].get("arguments", {}))}}
             for i, c in enumerate(calls)]
+
+
+def error_info(e):
+    """Turn an exception into a llama-server style error object."""
+    if isinstance(e, urllib.error.HTTPError):
+        code, text = e.code, e.read().decode(errors="replace")
+        try:
+            text = json.loads(text).get("error", text)
+        except (ValueError, AttributeError):
+            pass
+        msg = f"Ollama: {text}"
+    elif isinstance(e, urllib.error.URLError):
+        code, msg = 503, f"Ollama is not reachable at {OLLAMA} ({e.reason}). Is it running?"
+    elif isinstance(e, TimeoutError):
+        code, msg = 504, f"Ollama at {OLLAMA} timed out"
+    else:
+        import traceback
+        traceback.print_exception(type(e), e, e.__traceback__)
+        code, msg = 500, f"Proxy error: {type(e).__name__}: {e}"
+    return {"code": code, "message": msg, "type": "server_error"}
 
 
 def finish_reason(chunk, had_tools):
@@ -289,6 +337,12 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(f"data: {payload}\n\n".encode())
         self.wfile.flush()
 
+    def send_error_json(self, e):
+        """Report a failure as JSON the UI can display, never a dropped socket
+        (which the UI can only show as "Failed to connect to server")."""
+        err = error_info(e)
+        self.send_json({"error": err}, err["code"])
+
     def route(self):
         return urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
 
@@ -311,9 +365,11 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/slots":
                 return self.send_json([])
             if path in ("/tools", "/mcp-servers"):
-                return self.send_json({"error": {"code": 404, "message": "Not supported"}}, 404)
-        except urllib.error.URLError as e:
-            return self.send_json({"error": {"code": 503, "message": f"Ollama unreachable: {e}"}}, 503)
+                return self.feature_disabled()
+        except ConnectionError:
+            return
+        except Exception as e:
+            return self.send_error_json(e)
         # Single-page app: unknown non-file paths fall back to index.html.
         if not os.path.exists(os.path.join(ROOT, path.lstrip("/"))):
             self.path = "/index.html"
@@ -332,12 +388,20 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"success": True})
             if path == "/v1/chat/completions/control":
                 return self.send_json({"success": False, "error": "Not supported by Ollama"})
-        except urllib.error.HTTPError as e:
-            msg = e.read().decode(errors="replace")
-            return self.send_json({"error": {"code": e.code, "message": msg}}, e.code)
-        except urllib.error.URLError as e:
-            return self.send_json({"error": {"code": 503, "message": f"Ollama unreachable: {e}"}}, 503)
+            if path == "/v1/streams/lookup":
+                return self.send_json([])  # no resumable streams; UI then skips resuming
+            if path in ("/tools", "/mcp-servers"):
+                return self.feature_disabled()
+        except ConnectionError:
+            return
+        except Exception as e:
+            return self.send_error_json(e)
         self.send_json({"error": {"code": 404, "message": "File Not Found"}}, 404)
+
+    def feature_disabled(self):
+        # llama-server's wording; the UI recognises it and hides the feature quietly.
+        self.send_json({"error": {"code": 501, "type": "not_supported_error",
+                                  "message": "this feature is disabled (not supported with Ollama)"}}, 501)
 
     # -- endpoints
 
@@ -360,7 +424,8 @@ class Handler(SimpleHTTPRequestHandler):
             "role": "model",
             "model_alias": model,
             "model_path": model,
-            "chat_template": info.get("template", ""),
+            "chat_template": info.get("template", "") +
+                             (THINKING_MARKER if "thinking" in caps else ""),
             "modalities": {"vision": "vision" in caps, "audio": "audio" in caps},
             "default_generation_settings": {
                 "n_ctx": context_length(model, ps),
@@ -416,16 +481,59 @@ class Handler(SimpleHTTPRequestHandler):
         if not req["stream"]:
             return self.chat_blocking(req, cid, created)
 
-        upstream = ollama("/api/chat", req, stream=True)
-        hub.set(model, "loaded")
-        self.start_sse()
+        # Ollama sends nothing until the model is loaded, which can take a
+        # while on CPU. Open the request in the background: errors that come
+        # back quickly go to the UI as normal HTTP errors, and a slow load gets
+        # keep-alive pings instead of a silent connection.
+        t0 = time.time()
+        result = queue.Queue()
+
+        def open_upstream():
+            try:
+                result.put(ollama("/api/chat", req, stream=True))
+            except Exception as e:
+                result.put(e)
+
+        threading.Thread(target=open_upstream, daemon=True).start()
+        try:
+            upstream = result.get(timeout=3)
+        except queue.Empty:
+            upstream = None
+        if isinstance(upstream, Exception):
+            return self.send_error_json(upstream)
 
         def chunk(delta, finish=None, **extra):
             return {"id": cid, "object": "chat.completion.chunk", "created": created,
                     "model": model, "choices": [{"index": 0, "delta": delta,
                                                  "finish_reason": finish}], **extra}
 
-        t0, first, n, tool_count = time.time(), None, 0, 0
+        def fail(message):
+            # Once streaming has started the UI ignores error events and would
+            # sit on "Reconnecting to the stream...", so show the error as the
+            # reply and end the stream normally.
+            try:
+                self.sse(chunk({"content": f"\n\n⚠️ {message}"}))
+                self.sse(chunk({}, "stop"))
+                self.sse("[DONE]")
+            except OSError:
+                pass
+
+        self.start_sse()
+        try:
+            while upstream is None:
+                self.wfile.write(b": loading model\n\n")
+                self.wfile.flush()
+                try:
+                    upstream = result.get(timeout=1)
+                except queue.Empty:
+                    pass
+        except ConnectionError:
+            return  # user gave up; the background request finishes on its own
+        if isinstance(upstream, Exception):
+            return fail(error_info(upstream)["message"])
+        hub.set(model, "loaded")
+
+        first, n, tool_count = None, 0, 0
         try:
             self.sse(chunk({"role": "assistant", "content": None}))
             for line in upstream:
@@ -433,8 +541,7 @@ class Handler(SimpleHTTPRequestHandler):
                     continue
                 c = json.loads(line)
                 if c.get("error"):
-                    self.sse({"error": {"code": 500, "message": c["error"]}})
-                    break
+                    return fail(f"Ollama: {c['error']}")
                 msg = c.get("message") or {}
                 delta = {}
                 if msg.get("thinking"):
@@ -459,6 +566,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.sse("[DONE]")
         except ConnectionError:
             pass  # user pressed stop; closing upstream makes Ollama stop too
+        except Exception as e:  # e.g. Ollama crashed mid-reply
+            fail(error_info(e)["message"])
         finally:
             upstream.close()
 
@@ -684,6 +793,20 @@ def status():
                          "SilentlyContinue).State") or "Windows logon task: not installed")
 
 
+def disable_quick_edit():
+    """Clicking in a Windows console with QuickEdit on pauses the program at
+    its next log line, which freezes every request until a key is pressed."""
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h, mode = k.GetStdHandle(-10), ctypes.c_uint32()  # STD_INPUT_HANDLE
+        if k.GetConsoleMode(h, ctypes.byref(mode)):
+            # clear ENABLE_QUICK_EDIT_MODE (0x40), keep ENABLE_EXTENDED_FLAGS (0x80)
+            k.SetConsoleMode(h, (mode.value & ~0x40) | 0x80)
+    except Exception:
+        pass
+
+
 def main():
     global OLLAMA
     import sys
@@ -708,8 +831,17 @@ def main():
         return uninstall()
     if args.status:
         return status()
+    if os.name == "nt":
+        disable_quick_edit()
+        # On Windows SO_REUSEADDR lets a second copy bind the same port and
+        # silently steal requests; demand exclusive use instead.
+        ThreadingHTTPServer.allow_reuse_address = False
     threading.Thread(target=hub.poll_forever, daemon=True).start()
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as e:
+        raise SystemExit(f"Can't listen on {args.host}:{args.port} ({e}). Is it already "
+                         "running (--status), or is another program using that port?")
     server.daemon_threads = True
     print(f"llamafile UI -> Ollama at {OLLAMA}\nOpen http://{args.host}:{args.port}/")
     try:
