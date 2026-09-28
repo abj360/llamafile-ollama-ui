@@ -9,6 +9,25 @@ routes it to the models in your Ollama server.
     python3 server.py --port 9000 --ollama http://gpu-box:11434
     OLLAMA_NUM_CTX=16384 python3 server.py                # pass num_ctx to Ollama
 
+## Run detached (in the background, until reboot)
+
+Windows PowerShell:
+
+    Start-Process pythonw -ArgumentList 'server.py' -WorkingDirectory $PWD -WindowStyle Hidden
+    # log: %LOCALAPPDATA%\llamafile-ollama-ui\server.log
+    # stop:
+    Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | Where-Object CommandLine -match 'server.py' | ForEach-Object { Stop-Process -Id $_.ProcessId }
+
+Linux / macOS / WSL:
+
+    nohup python3 server.py > server.log 2>&1 &
+    # stop:
+    pkill -f 'python3 server.py'
+
+Add any flags after `server.py`, e.g. `'server.py --host 0.0.0.0 --port 9000'`.
+It keeps running after you close the terminal, but not after a reboot. For that,
+use `--install` below.
+
 ## Run permanently (survives reboots)
 
 Run this once on the machine that should host the UI:
