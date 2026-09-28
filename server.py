@@ -12,6 +12,7 @@ emulates llama-server in "router" mode and translates each call to Ollama:
   GET  /models/sse               -> model status events (polls /api/ps)
 
 Standard library only. Usage: python3 server.py [--port 8080] [--ollama URL]
+Run once with --install to keep it running across reboots.
 """
 
 import argparse
@@ -480,14 +481,166 @@ class Handler(SimpleHTTPRequestHandler):
         })
 
 
+# --------------------------------------------------------------------------
+# Run-at-boot installation (systemd user service, launchd, WSL logon task)
+
+SERVICE = "llamafile-ollama-ui"
+WSL_TASK = "llamafile-ollama-ui (start WSL)"
+
+
+def sh(*cmd, check=True):
+    import subprocess
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise SystemExit(f"command failed: {' '.join(cmd)}\n{r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def is_wsl():
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+def powershell(script):
+    return sh("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
+
+
+def install(args):
+    import platform
+    import shlex
+    import sys
+    exe = [sys.executable, os.path.abspath(__file__), "--host", args.host,
+           "--port", str(args.port), "--ollama", args.ollama]
+    env = {"OLLAMA_NUM_CTX": str(NUM_CTX)} if NUM_CTX else {}
+
+    if platform.system() == "Darwin":
+        plist = os.path.expanduser(f"~/Library/LaunchAgents/com.{SERVICE}.plist")
+        items = "".join(f"<string>{a}</string>" for a in exe)
+        envs = "".join(f"<key>{k}</key><string>{v}</string>" for k, v in env.items())
+        os.makedirs(os.path.dirname(plist), exist_ok=True)
+        with open(plist, "w") as f:
+            f.write(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.{SERVICE}</string>
+<key>ProgramArguments</key><array>{items}</array>
+<key>EnvironmentVariables</key><dict>{envs}</dict>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>StandardErrorPath</key><string>/tmp/{SERVICE}.log</string>
+</dict></plist>
+""")
+        sh("launchctl", "unload", plist, check=False)
+        sh("launchctl", "load", "-w", plist)
+        print(f"Installed LaunchAgent {plist}")
+    elif platform.system() == "Linux":
+        unit = os.path.expanduser(f"~/.config/systemd/user/{SERVICE}.service")
+        os.makedirs(os.path.dirname(unit), exist_ok=True)
+        envs = "".join(f"Environment={k}={v}\n" for k, v in env.items())
+        with open(unit, "w") as f:
+            f.write(f"""[Unit]
+Description=llamafile web UI routed to Ollama
+# Pulls in a user-level ollama.service if there is one; harmless otherwise.
+Wants=ollama.service
+After=network.target ollama.service
+
+[Service]
+ExecStart={shlex.join(exe)}
+{envs}Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+""")
+        sh("systemctl", "--user", "daemon-reload")
+        sh("systemctl", "--user", "enable", "--now", SERVICE)
+        sh("systemctl", "--user", "restart", SERVICE)
+        # Linger starts user services at boot, without anyone logging in.
+        user = os.environ.get("USER") or sh("id", "-un")
+        if "Linger=yes" not in sh("loginctl", "show-user", user, "-p", "Linger", check=False):
+            sh("loginctl", "enable-linger", user)
+        print(f"Installed systemd user service {unit}")
+        if is_wsl():
+            install_wsl_task()
+    else:
+        raise SystemExit("--install supports Linux (systemd), WSL and macOS")
+    print(f"Running now and on every boot: http://{args.host}:{args.port}/")
+
+
+def install_wsl_task():
+    """WSL only boots when something launches it, so start it at Windows logon.
+
+    The task runs `sleep infinity` in the distro through a headless console:
+    no window, and the open session stops WSL shutting the distro down idle.
+    """
+    distro = os.environ.get("WSL_DISTRO_NAME") or "Ubuntu"
+    powershell(f"""
+$a = New-ScheduledTaskAction -Execute 'conhost.exe' `
+     -Argument '--headless wsl.exe -d "{distro}" --exec sleep infinity'
+$t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries `
+     -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName '{WSL_TASK}' -Action $a -Trigger $t -Settings $s `
+     -Description 'Starts WSL ({distro}) at logon so {SERVICE} runs' -Force | Out-Null
+Start-ScheduledTask -TaskName '{WSL_TASK}'
+""")
+    print(f"Installed Windows logon task '{WSL_TASK}' (keeps WSL {distro} running)")
+
+
+def uninstall():
+    import platform
+    if platform.system() == "Darwin":
+        plist = os.path.expanduser(f"~/Library/LaunchAgents/com.{SERVICE}.plist")
+        sh("launchctl", "unload", "-w", plist, check=False)
+        if os.path.exists(plist):
+            os.remove(plist)
+    else:
+        sh("systemctl", "--user", "disable", "--now", SERVICE, check=False)
+        unit = os.path.expanduser(f"~/.config/systemd/user/{SERVICE}.service")
+        if os.path.exists(unit):
+            os.remove(unit)
+        sh("systemctl", "--user", "daemon-reload", check=False)
+        if is_wsl():
+            # Leaves the running WSL session alone; it just won't start at logon.
+            powershell(f"Unregister-ScheduledTask -TaskName '{WSL_TASK}' -Confirm:$false "
+                       "-ErrorAction SilentlyContinue")
+    print(f"Uninstalled {SERVICE}; it will no longer start at boot")
+
+
+def status():
+    import platform
+    if platform.system() == "Darwin":
+        print(sh("launchctl", "list", f"com.{SERVICE}", check=False) or "not installed")
+        return
+    print(sh("systemctl", "--user", "status", SERVICE, "--no-pager", "-n", "5", check=False)
+          or "not installed")
+    if is_wsl():
+        print(powershell(f"(Get-ScheduledTask -TaskName '{WSL_TASK}' -ErrorAction "
+                         "SilentlyContinue).State") or "Windows logon task: not installed")
+
+
 def main():
     global OLLAMA
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--ollama", default=OLLAMA, help="Ollama base URL (default %(default)s)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--install", action="store_true",
+                      help="run now and on every boot (with these --host/--port/--ollama)")
+    mode.add_argument("--uninstall", action="store_true", help="stop and remove from boot")
+    mode.add_argument("--status", action="store_true", help="show the boot service status")
     args = p.parse_args()
     OLLAMA = args.ollama.rstrip("/")
+    args.ollama = OLLAMA
+    if args.install:
+        return install(args)
+    if args.uninstall:
+        return uninstall()
+    if args.status:
+        return status()
     threading.Thread(target=hub.poll_forever, daemon=True).start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
