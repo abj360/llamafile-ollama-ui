@@ -403,7 +403,7 @@ class Handler(SimpleHTTPRequestHandler):
                 except queue.Empty:
                     self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        except OSError:
             pass
         finally:
             hub.unsubscribe(q)
@@ -457,7 +457,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "total_tokens": t["prompt_n"] + t["predicted_n"]}))
                     break
             self.sse("[DONE]")
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
             pass  # user pressed stop; closing upstream makes Ollama stop too
         finally:
             upstream.close()
@@ -482,10 +482,11 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 # --------------------------------------------------------------------------
-# Run-at-boot installation (systemd user service, launchd, WSL logon task)
+# Run-at-boot installation (systemd user service, launchd, Windows task)
 
 SERVICE = "llamafile-ollama-ui"
 WSL_TASK = "llamafile-ollama-ui (start WSL)"
+WIN_TASK = "llamafile-ollama-ui"
 
 
 def sh(*cmd, check=True):
@@ -564,9 +565,61 @@ WantedBy=default.target
         print(f"Installed systemd user service {unit}")
         if is_wsl():
             install_wsl_task()
+    elif platform.system() == "Windows":
+        install_windows(exe)
     else:
-        raise SystemExit("--install supports Linux (systemd), WSL and macOS")
+        raise SystemExit("--install supports Windows, Linux (systemd), WSL and macOS")
     print(f"Running now and on every boot: http://{args.host}:{args.port}/")
+
+
+def ps_quote(s):
+    return "'" + s.replace("'", "''") + "'"
+
+
+def install_windows(exe):
+    """Scheduled task running pythonw.exe (no console window).
+
+    As administrator it starts at boot, before anyone logs in (S4U logon, no
+    stored password). Otherwise it starts when this user logs in.
+    """
+    import subprocess
+    import sys
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(pyw):
+        pyw = sys.executable
+    arguments = subprocess.list2cmdline(exe[1:])
+    envs = "".join(f"[Environment]::SetEnvironmentVariable({ps_quote(k)}, {ps_quote(v)}, 'User')\n"
+                   for k, v in ({"OLLAMA_NUM_CTX": str(NUM_CTX)} if NUM_CTX else {}).items())
+    out = powershell(f"""
+{envs}$admin = ([Security.Principal.WindowsPrincipal] `
+    [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrators')
+$a = New-ScheduledTaskAction -Execute {ps_quote(pyw)} -Argument {ps_quote(arguments)} `
+     -WorkingDirectory {ps_quote(os.path.dirname(os.path.abspath(__file__)))}
+$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries `
+     -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew `
+     -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+if ($admin) {{
+  $t = New-ScheduledTaskTrigger -AtStartup
+  $p = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\\$env:USERNAME" -LogonType S4U
+}} else {{
+  $t = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\\$env:USERNAME"
+  $p = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\\$env:USERNAME" -LogonType Interactive
+}}
+Stop-ScheduledTask -TaskName {ps_quote(WIN_TASK)} -ErrorAction SilentlyContinue
+Register-ScheduledTask -TaskName {ps_quote(WIN_TASK)} -Action $a -Trigger $t -Settings $s `
+     -Principal $p -Description 'llamafile web UI routed to Ollama' -Force | Out-Null
+Start-ScheduledTask -TaskName {ps_quote(WIN_TASK)}
+if ($admin) {{ 'boot' }} else {{ 'logon' }}
+""")
+    when = "Windows starts" if out.endswith("boot") else \
+        "you log in (run as administrator to start at boot instead)"
+    print(f"Installed scheduled task '{WIN_TASK}'; it starts every time {when}")
+    print(f"Log: {log_path()}")
+
+
+def log_path():
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, SERVICE, "server.log")
 
 
 def install_wsl_task():
@@ -591,7 +644,11 @@ Start-ScheduledTask -TaskName '{WSL_TASK}'
 
 def uninstall():
     import platform
-    if platform.system() == "Darwin":
+    if platform.system() == "Windows":
+        powershell(f"Stop-ScheduledTask -TaskName {ps_quote(WIN_TASK)} -ErrorAction SilentlyContinue; "
+                   f"Unregister-ScheduledTask -TaskName {ps_quote(WIN_TASK)} -Confirm:$false "
+                   "-ErrorAction SilentlyContinue")
+    elif platform.system() == "Darwin":
         plist = os.path.expanduser(f"~/Library/LaunchAgents/com.{SERVICE}.plist")
         sh("launchctl", "unload", "-w", plist, check=False)
         if os.path.exists(plist):
@@ -611,6 +668,12 @@ def uninstall():
 
 def status():
     import platform
+    if platform.system() == "Windows":
+        print(powershell(f"$t = Get-ScheduledTask -TaskName {ps_quote(WIN_TASK)} -ErrorAction "
+                         "SilentlyContinue; if ($t) { 'Scheduled task: ' + $t.State } "
+                         "else { 'not installed' }"))
+        print(f"Log: {log_path()}")
+        return
     if platform.system() == "Darwin":
         print(sh("launchctl", "list", f"com.{SERVICE}", check=False) or "not installed")
         return
@@ -623,6 +686,10 @@ def status():
 
 def main():
     global OLLAMA
+    import sys
+    if sys.stdout is None or sys.stderr is None:  # pythonw.exe has no console
+        os.makedirs(os.path.dirname(log_path()), exist_ok=True)
+        sys.stdout = sys.stderr = open(log_path(), "a", buffering=1, encoding="utf-8")
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
